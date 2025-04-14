@@ -19,12 +19,12 @@ from shapely.ops import unary_union, transform
 from shapely.affinity import rotate
 from lxml import etree
 import pyproj
-import random
+# import random # Removed
 import simplekml
 import math
 import os # Needed for path manipulation
 import zipfile # Needed for KMZ
-import io # Needed for reading from zip
+# import io # Needed for reading from zip
 
 # Tolerance for floating point comparisons
 TOLERANCE = 1e-9
