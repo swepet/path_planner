@@ -1,4 +1,7 @@
 # path_planner
+
+![Path image](path.png)
+
 This script generates a boustrophedon (lawnmower pattern) path within specified 
 target polygons defined in a KML/KMZ file, while avoiding designated obstacle 
 polygons from the same file. It handles coordinate transformations (WGS84 to UTM), 
