@@ -122,7 +122,7 @@ def read_kml_polygons(kml_file):
     print(f"Read {len(all_polygons_data)} total polygons from KML content.")
     return all_polygons_data
 
-def generate_boustrophedon_path(main_polygon_deg, separation_meters=0.3, angle_deg=90.0):
+def generate_boustrophedon_path(main_polygon_deg, separation_meters=0.3, angle_deg=90.0, safety_distance=0.0):
     """
     Generate a boustrophedon path at a specified angle and separation.
     Projects to UTM, rotates, calculates path, rotates back.
@@ -149,16 +149,42 @@ def generate_boustrophedon_path(main_polygon_deg, separation_meters=0.3, angle_d
     transformer_to_deg = pyproj.Transformer.from_crs(crs_proj, crs_deg, always_xy=True)
 
     main_geometry_proj = transform(transformer_to_proj.transform, main_polygon_deg)
-    # Use bounds of potentially MultiPolygon
-    bounds_proj_for_width = main_geometry_proj.bounds 
+    
+    # --- Apply Negative Buffer for Insetting based on safety_distance --- 
+    main_geometry_proj_for_path = main_geometry_proj # Default to original
+    if safety_distance > TOLERANCE: # Only buffer if safety_distance is positive
+        inset_distance = -abs(safety_distance)
+        print(f"Debug (generate_path): Applying inset buffer: {inset_distance:.4f}m")
+        try:
+            main_geometry_proj_inset = main_geometry_proj.buffer(inset_distance, join_style=2) # MITRE join style
+            # Check if buffering resulted in empty or invalid geometry
+            if main_geometry_proj_inset.is_empty or not main_geometry_proj_inset.is_valid:
+                print(f"Warning: Negative buffering by {abs(inset_distance):.4f}m resulted in empty/invalid geometry (polygon might be too thin). Using original polygon boundary.")
+                # Keep main_geometry_proj_for_path as the original
+            else:
+                print(f"Debug (generate_path): Using inset geometry for path generation.") 
+                main_geometry_proj_for_path = main_geometry_proj_inset
+                # Optional: Check area reduction
+                # area_orig = main_geometry_proj.area
+                # area_inset = main_geometry_proj_for_path.area
+                # print(f"Debug (generate_path): Area reduced from {area_orig:.2f} to {area_inset:.2f} sq meters.")
+        except Exception as e:
+            print(f"Warning: Error applying negative buffer: {e}. Using original polygon boundary.")
+            # Keep main_geometry_proj_for_path as the original
+    else:
+        print("Debug (generate_path): Safety distance is zero or negative, no inset buffer applied.")
+
+    # --- Use the (potentially inset) geometry for subsequent steps --- 
+    bounds_proj_for_width = main_geometry_proj_for_path.bounds # Use bounds of inset polygon for width/centroid?
     width_proj = bounds_proj_for_width[2] - bounds_proj_for_width[0] 
-    centroid_proj = main_geometry_proj.centroid
+    centroid_proj = main_geometry_proj_for_path.centroid # Use centroid of inset polygon for rotation center
 
     # --- Rotation Setup --- 
     math_angle_deg = (90.0 - angle_deg) % 360.0 
 
     # --- Rotate Polygon for Horizontal Scan --- 
-    geometry_rotated = rotate(main_geometry_proj, -math_angle_deg, origin=centroid_proj)
+    # Rotate the inset geometry
+    geometry_rotated = rotate(main_geometry_proj_for_path, -math_angle_deg, origin=centroid_proj)
     
     # --- Generate Path on Rotated Polygon --- 
     bounds_rot = geometry_rotated.bounds
@@ -278,34 +304,38 @@ def generate_boustrophedon_path(main_polygon_deg, separation_meters=0.3, angle_d
 
     return final_path_clean_proj, centroid_proj, transformer_to_proj, transformer_to_deg
 
-def split_path_by_obstacles(base_path_proj, obstacles_proj, separation_meters=0.3):
+def split_path_by_obstacles(base_path_proj, obstacles_proj):
     """
     Splits a base path LineString (PROJECTED) by subtracting obstacles (PROJECTED).
+    Assumes the obstacles_proj passed in have ALREADY been buffered by the desired safety distance.
     Returns a list of LineString tracks (PROJECTED) that are outside obstacles.
     """
     if not base_path_proj.is_valid or base_path_proj.is_empty:
         print("Warning: Base path is invalid or empty for splitting.")
-        return []
-    if not obstacles_proj:
+
         return [base_path_proj]
 
     valid_obstacles_proj = [obs for obs in obstacles_proj if obs.is_valid and not obs.is_empty]
     if not valid_obstacles_proj:
-        # print("No valid projected obstacles to split by.") # Removed
+        # No valid obstacles provided (maybe originals were invalid or buffer failed)
+        # print("No valid projected obstacles to split by.")
         return [base_path_proj]
 
     # --- Difference Operation (Projected Coords) ---
-    # Use a small buffer based purely on TOLERANCE for splitting
-    SPLIT_BUFFER = TOLERANCE * 50 # Drastically reduced buffer
+    # The obstacles are already buffered, so just union them
     try:
          obstacles_union_proj = unary_union(valid_obstacles_proj)
-         buffered_obstacles_union_proj = obstacles_union_proj.buffer(SPLIT_BUFFER, join_style=2) 
+         # Check if union is valid before proceeding
+         if not obstacles_union_proj.is_valid:
+             print("Warning: Union of obstacles resulted in invalid geometry. Proceeding without splitting.")
+             return [base_path_proj]
     except Exception as e:
-         print(f"Error buffering/unioning obstacles: {e}. Proceeding without splitting.")
+         print(f"Error unioning obstacles: {e}. Proceeding without splitting.")
          return [base_path_proj]
 
     try:
-        path_after_difference = base_path_proj.difference(buffered_obstacles_union_proj)
+        # Perform the difference using the (already buffered) obstacle union
+        path_after_difference = base_path_proj.difference(obstacles_union_proj)
     except Exception as e:
         print(f"Error performing difference operation: {e}. Proceeding without splitting.")
         return [base_path_proj]
@@ -1076,6 +1106,10 @@ def main():
                         help='Separation between path lines in meters. Default is 0.3.')
     parser.add_argument('--reverse', action='store_true', 
                         help='Reverse the order of points in the final output path.')
+    parser.add_argument('--ignore', dest='ignore_polygon_names', action='append', default=[],
+                        help='Name of a polygon within the KML to completely ignore. Can be specified multiple times.')
+    parser.add_argument('--safe', type=float, default=0.0,
+                        help='Safety distance in meters to keep away from target edges and obstacles. Default is 0.0.')
 
     # --- Check for missing arguments (only input_kml is mandatory now) ---
     # This check might need refinement if other args become mandatory again
@@ -1094,9 +1128,11 @@ def main():
 
     input_kml = args.input_kml
     target_polygon_names_arg = args.target_polygon_names 
+    ignore_polygon_names_arg = args.ignore_polygon_names # Get the ignored names
     angle_degrees = args.angle
     separation_in_meters = args.sep
     reverse_final_path = args.reverse 
+    safety_distance = args.safe # Get the safety distance
 
     # --- Determine Output KML filename --- 
     if args.output_kml_file:
@@ -1111,9 +1147,28 @@ def main():
     print(f"Input KML: {input_kml}")
     print(f"Output KML: {output_kml_file}")
     print(f"Internal KML Track Name: {output_prefix}") 
-
+    print(f"Path Angle: {angle_degrees} degrees")
+    print(f"Path Separation: {separation_in_meters} meters")
+    print(f"Safety Distance: {safety_distance} meters")
 
     all_polygons_data = read_kml_polygons(input_kml) 
+    
+    # --- Filter out ignored polygons FIRST --- 
+    ignore_names_set = set(ignore_polygon_names_arg) # Use a set for faster lookup
+    filtered_polygons_data = []
+    ignored_count = 0
+    for name, poly in all_polygons_data:
+        if name in ignore_names_set:
+            ignored_count += 1
+        else:
+            filtered_polygons_data.append((name, poly))
+    
+    if ignored_count > 0:
+        print(f"Ignored {ignored_count} polygons based on --ignore argument: {ignore_polygon_names_arg}")
+    elif ignore_polygon_names_arg: # Print even if none were found matching
+        print(f"Specified polygons to ignore, but none matched in the KML: {ignore_polygon_names_arg}")
+        
+    # --- Use filtered_polygons_data for the rest of the logic --- 
     
     # Keep track of names and geometries together
     target_polygons_with_names = [] 
@@ -1124,8 +1179,9 @@ def main():
     # --- Target / Obstacle Separation Logic --- 
     if not target_polygon_names_arg: # Default: largest polygon
         print("No target polygons specified via --target. Finding largest polygon by area.")
-        if not all_polygons_data:
-            print("Error: No polygons found in KML to determine the largest one.")
+        # Use filtered data here
+        if not filtered_polygons_data:
+            print("Error: No polygons remain after filtering ignored ones.")
             sys.exit(1)
             
         largest_poly = None
@@ -1135,9 +1191,10 @@ def main():
         # Calculate areas in a suitable projected CRS for better accuracy
         # We need a temporary projection just for area comparison
         # Find a central point for a representative CRS
-        valid_polys_for_bounds = [p[1] for p in all_polygons_data if p[1].is_valid]
+        # Use filtered data here
+        valid_polys_for_bounds = [p[1] for p in filtered_polygons_data if p[1].is_valid]
         if not valid_polys_for_bounds:
-             print("Error: No valid polygons available to determine bounds/centroid.")
+             print("Error: No valid polygons remain after filtering to determine bounds/centroid.")
              sys.exit(1)
              
         combined_bounds = unary_union(valid_polys_for_bounds).bounds
@@ -1155,7 +1212,7 @@ def main():
             print(f"Warning: Could not create temporary projection {temp_crs_proj} for area calculation ({e}). Area comparison might be less accurate.")
             can_project_for_area = False
 
-        for name, poly_deg in all_polygons_data:
+        for name, poly_deg in filtered_polygons_data:
             current_area = 0.0
             if can_project_for_area:
                  try:
@@ -1183,8 +1240,9 @@ def main():
         target_polygons_with_names.append((largest_name, largest_poly))
         target_polygon_names_found.append(largest_name)
         
-        # All other polygons are obstacles
-        for name, poly in all_polygons_data:
+        # All other polygons (from the filtered list) are obstacles
+        # Use filtered data here
+        for name, poly in filtered_polygons_data:
              if poly != largest_poly:
                   obstacles_with_names.append((name, poly)) # Store tuple
                   obstacle_names.append(name)
@@ -1194,8 +1252,9 @@ def main():
         target_names_set = set(target_polygon_names_arg)
         # Store found polygons temporarily to allow reordering later
         found_polygons_map = {} 
-
-        for name, poly in all_polygons_data:
+        
+        # Use filtered data here
+        for name, poly in filtered_polygons_data:
             if name in target_names_set:
                 if name not in found_polygons_map:
                      found_polygons_map[name] = poly
@@ -1208,10 +1267,10 @@ def main():
         found_names_set = set(found_polygons_map.keys())
         missing_names = target_names_set - found_names_set
         if missing_names:
-            print(f"Warning: The following specified target polygons were not found in the KML: {list(missing_names)}")
+            print(f"Warning: The following specified target polygons were not found (or were ignored): {list(missing_names)}")
             
         if not found_polygons_map:
-             print(f"Error: None of the specified target polygons ({target_polygon_names_arg}) were found in the KML file.")
+             print(f"Error: None of the specified target polygons ({target_polygon_names_arg}) were found (or all were ignored) in the KML file.")
              sys.exit(1)
         
         # Reorder target polygons based on argument order, storing tuples
@@ -1273,53 +1332,75 @@ def main():
          print(f"Error creating coordinate transformers for CRS {crs_proj}: {e}")
          sys.exit(1)
     
-    # --- Project Obstacles to UTM --- Now transformers are defined
-    obstacles_proj = []
+    # --- Project Obstacles to UTM --- 
+    obstacles_proj_orig = [] 
     valid_obstacles_deg = [obs for obs in obstacles_deg if obs.is_valid and not obs.is_empty]
     for i, obs_deg in enumerate(valid_obstacles_deg):
         try:
-            obstacles_proj.append(transform(transformer_to_proj.transform, obs_deg))
+            obstacles_proj_orig.append(transform(transformer_to_proj.transform, obs_deg))
         except Exception as e:
             print(f"Warning: Could not project obstacle {i+1} to UTM: {e}")
             
-    print(f"Projected {len(obstacles_proj)} valid obstacles to UTM.")
+    # --- Apply Safety Buffer to Projected Obstacles --- 
+    obstacles_proj_buffered = []
+    if safety_distance > TOLERANCE and obstacles_proj_orig:
+        print(f"Applying +{safety_distance:.4f}m safety buffer to {len(obstacles_proj_orig)} projected obstacles...")
+        buffer_amount = abs(safety_distance)
+        for i, obs_proj in enumerate(obstacles_proj_orig):
+            try:
+                buffered_obs = obs_proj.buffer(buffer_amount, join_style=2)
+                if buffered_obs.is_valid and not buffered_obs.is_empty:
+                    obstacles_proj_buffered.append(buffered_obs)
+                else:
+                    print(f"Warning: Buffering obstacle {i+1} resulted in invalid/empty geometry. Using original projected obstacle for safety.")
+                    obstacles_proj_buffered.append(obs_proj) # Fallback to original projected
+            except Exception as e:
+                print(f"Warning: Error buffering obstacle {i+1}: {e}. Using original projected obstacle for safety.")
+                obstacles_proj_buffered.append(obs_proj) # Fallback to original projected
+    else:
+        # If no safety distance or no obstacles, use the original projected list
+        print("No positive safety distance specified or no obstacles found, using original obstacle boundaries.")
+        obstacles_proj_buffered = obstacles_proj_orig
+            
+    print(f"Using {len(obstacles_proj_buffered)} obstacles (potentially buffered) for path avoidance.")
+
+    # --- Generate Base Path (Projected) --- MOVED HERE
+    base_path_proj = None
+    path_centroid_proj = None 
+    path_transformer_to_deg = None # Initialize
     
-    # --- Check if target polygons intersect --- 
+    # --- Check if target polygons intersect (using projected for accuracy) --- 
     targets_intersect = False
+    target_polygons_proj = []
     if len(target_polygons_deg) > 1:
         from itertools import combinations
         try:
              target_polygons_proj = [transform(transformer_to_proj.transform, p) for p in target_polygons_deg]
              for poly1_proj, poly2_proj in combinations(target_polygons_proj, 2):
-                  if poly1_proj.intersects(poly2_proj):
+                  # Use a small tolerance for intersection check?
+                  if poly1_proj.buffer(TOLERANCE).intersects(poly2_proj.buffer(TOLERANCE)):
                        targets_intersect = True
                        print("Target polygons intersect (or touch). Merging them for path generation.")
                        break 
         except Exception as e:
              print(f"Warning: Error projecting/checking intersection of target polygons: {e}. Proceeding assuming they might intersect.")
              targets_intersect = True
-             
-    # --- Generate Base Path (Projected) --- 
-    base_path_proj = None
-    # Store centroid returned by generate_boustrophedon_path, might differ if multiple paths run
-    path_centroid_proj = None 
     
     if targets_intersect or len(target_polygons_deg) == 1:
         print("Generating base path for merged/single target area...")
+        # Combine the original degree polygons for the path generation input
         main_geometry_deg = unary_union(target_polygons_deg) 
         if not main_geometry_deg.is_valid or main_geometry_deg.is_empty:
              print("Error: Merged target geometry is invalid or empty. Exiting.")
              sys.exit(1)
         
         # Call generate_boustrophedon_path once 
-        # It will use its own internally calculated transformers based on the merged geometry
         base_path_proj, path_centroid_proj, _, path_transformer_to_deg = generate_boustrophedon_path(
             main_geometry_deg, 
             separation_meters=separation_in_meters, 
-            angle_deg=angle_degrees
+            angle_deg=angle_degrees,
+            safety_distance=safety_distance # Pass safety distance
         )
-        # Need to capture the specific transformer used for the final transformation back
-        # as the global one might be slightly different if centroid shifted
         
     else: # Targets do not intersect, generate paths separately and combine
         print("Generating base paths for separate target areas...")
@@ -1333,20 +1414,19 @@ def main():
             path_proj, current_centroid_proj, _, current_transformer_to_deg = generate_boustrophedon_path(
                 poly_deg, 
                 separation_meters=separation_in_meters, 
-                angle_deg=angle_degrees
+                angle_deg=angle_degrees,
+                safety_distance=safety_distance # Pass safety distance
             )
             
-            if path_proj and not path_centroid_proj: # Store centroid from first path
+            if not path_centroid_proj: # Store centroid from first path if not set
                  path_centroid_proj = current_centroid_proj
-            if path_proj and not first_path_transformer_to_deg:
+            if not first_path_transformer_to_deg: # Store transformer from first path
                  first_path_transformer_to_deg = current_transformer_to_deg
                  
             if path_proj and not path_proj.is_empty and path_proj.coords:
                  path_coords = list(path_proj.coords)
-                 if all_paths_coords_proj and len(path_coords) > 0:
-                     all_paths_coords_proj.extend(path_coords)
-                 else:
-                      all_paths_coords_proj.extend(path_coords)
+                 # Simple concatenation - might need smarter joining later if gaps are large
+                 all_paths_coords_proj.extend(path_coords)
             else:
                  print(f"Warning: No valid path generated for target '{poly_name}'.")
                  
@@ -1354,6 +1434,7 @@ def main():
             print("Error: No path segments generated for any separate target polygon. Exiting.")
             sys.exit(1)
             
+        # Clean the combined path
         cleaned_combined_coords = []
         if all_paths_coords_proj:
              cleaned_combined_coords.append(all_paths_coords_proj[0])
@@ -1369,20 +1450,24 @@ def main():
         path_transformer_to_deg = first_path_transformer_to_deg # Use transformer from first segment for final conversion
         print(f"Combined separate paths into a single base path (Points: {len(base_path_proj.coords)}).")
 
+    # --- Error check for base path generation --- 
     if base_path_proj is None or not base_path_proj.is_valid or base_path_proj.is_empty:
-        print("Error: Base path generation failed. Exiting.")
+        print("Error: Base path generation failed or resulted in empty path. Exiting.")
         sys.exit(1)
         
-    # --- The rest of the process uses the generated base_path_proj and projected obstacles --- 
+    # --- The rest of the process uses the generated base_path_proj and the buffered obstacles --- 
     
-    # --- Find Intersection Points (Projected) ---
-    intersection_points_proj = _find_intersection_points(base_path_proj, obstacles_proj)
+    # --- Find Intersection Points (Projected) --- 
+    # Use the BUFFERED obstacles to find intersection points
+    intersection_points_proj = _find_intersection_points(base_path_proj, obstacles_proj_buffered)
     
     # --- Create Augmented Obstacle Tracks (Projected) ---
-    obstacle_tracks_proj = create_augmented_obstacle_tracks(obstacles_proj, intersection_points_proj)
+    # Use the BUFFERED obstacles to create the tracks for stitching
+    obstacle_tracks_proj = create_augmented_obstacle_tracks(obstacles_proj_buffered, intersection_points_proj)
     
     # --- Split the Base Path by Obstacles (Projected) ---
-    split_tracks_proj = split_path_by_obstacles(base_path_proj, obstacles_proj, separation_in_meters)
+    # Pass the BUFFERED obstacles to split_path_by_obstacles
+    split_tracks_proj = split_path_by_obstacles(base_path_proj, obstacles_proj_buffered)
     
     final_stitched_path_proj = None 
     final_path_length_m = 0.0
